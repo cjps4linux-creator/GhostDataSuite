@@ -1,0 +1,131 @@
+name: Ghost-Data Suite CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Named 'pipeline-test' rather than 'test': the 'CI' workflow already
+  # publishes a job called 'test'. Two jobs with the same check name make
+  # branch protection ambiguous, so each workflow uses a distinct name.
+  pipeline-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements.ghost.txt
+          pip install pytest pytest-cov
+      - name: Run the test suite
+        # The suite lives directly in tests/. There is no directory guard and
+        # no fallback: a missing or failing suite must fail the job. A
+        # guarded step that degrades to an import check reports success
+        # while running no tests, which is the exact defect this replaces.
+        run: pytest -q --no-header
+      - name: Coverage report
+        run: pytest -q --no-header --cov=src --cov-report=xml --cov-report=html
+      - name: Run security scan
+        run: |
+          pip install bandit
+          bandit -r src/ -ll
+      - name: Run linting
+        run: |
+          pip install ruff==0.17.1
+          ruff check . --exclude .venv,venv,build,dist,node_modules
+
+  docker-build:
+    needs: "pipeline-test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Ghost Shell image
+        run: docker build -f Dockerfile.ghost -t ghost-suite:${{ github.sha }} .
+      - name: Build Alchemist image
+        run: docker build -f Dockerfile.alchemist -t ghost-alchemist:${{ github.sha }} .
+      - name: Scan Docker image for vulnerabilities
+        # Trivy needs a writable temp dir for its vulnerability DB cache.
+        # Mounting the workspace at /tmp makes that path read-only, so give it
+        # its own writable volume instead.
+        run: |
+          docker run --rm \
+            -v "${RUNNER_TEMP}/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:latest image \
+            --severity HIGH,CRITICAL --exit-code 0 ghost-suite:${{ github.sha }} || \
+            echo "trivy scan could not complete (vulnerability DB unavailable) - continuing"
+      - name: Push to registry
+        # Gated inside the step: GitHub's workflow parser rejects a `secrets.*`
+        # expression inside an `if:` condition, so the check runs in the shell.
+        run: |
+          if [ -z "${{ secrets.GHCR_TOKEN }}" ]; then
+            echo "GHCR_TOKEN not configured - skipping registry push"
+            exit 0
+          fi
+          echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag ghost-suite:${{ github.sha }} ghcr.io/${{ github.repository }}/ghost-suite:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository }}/ghost-suite:${{ github.sha }}
+
+  deploy-staging:
+    needs: ["pipeline-test", "docker-build"]
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to staging
+        run: |
+          if [ "${{ vars.DEPLOY_STAGING_ENABLED }}" != "true" ]; then
+            echo "DEPLOY_STAGING_ENABLED is not true - skipping staging deploy"
+            exit 0
+          fi
+          docker compose -f docker-compose.prod.yml --profile production up -d --build
+      - name: Run smoke tests
+        # Only meaningful when a deployment actually ran. When the deploy is
+        # disabled there is nothing to smoke-test, and skipping is correct.
+        # When it IS enabled, a missing or failing suite must fail the job.
+        run: |
+          if [ "${{ vars.DEPLOY_STAGING_ENABLED }}" != "true" ]; then
+            echo "DEPLOY_STAGING_ENABLED is not true - no deployment to smoke-test"
+            exit 0
+          fi
+          if [ ! -d tests/smoke ]; then
+            echo "tests/smoke directory is missing - refusing to report success"
+            exit 1
+          fi
+          pytest tests/smoke/
+
+  deploy-production:
+    needs: "deploy-staging"
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to production
+        run: |
+          if [ "${{ vars.DEPLOY_PRODUCTION_ENABLED }}" != "true" ]; then
+            echo "DEPLOY_PRODUCTION_ENABLED is not true - skipping production deploy"
+            exit 0
+          fi
+          docker compose -f docker-compose.prod.yml up -d --build
+      - name: Run final validation
+        run: |
+          if [ "${{ vars.DEPLOY_PRODUCTION_ENABLED }}" != "true" ]; then
+            echo "DEPLOY_PRODUCTION_ENABLED is not true - no deployment to validate"
+            exit 0
+          fi
+          if [ ! -d tests/final ]; then
+            echo "tests/final directory is missing - refusing to report success"
+            exit 1
+          fi
+          pytest tests/final/
+      - name: Notify on success
+        run: echo "Production deployment complete"

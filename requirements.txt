@@ -1,0 +1,9 @@
+# Ghost Data Suite  -  runtime dependencies
+flask>=2.3,<3.0
+flask-limiter>=3.5
+flask-socketio>=5.3
+playwright>=1.40,<2.0
+cryptography>=41,<44
+pyyaml>=6.0
+python-dateutil>=2.8
+prometheus-client>=0.20

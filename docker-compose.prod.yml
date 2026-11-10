@@ -1,0 +1,209 @@
+version: "3.8"
+
+services:
+  ghost-shell:
+    build:
+      context: .
+      dockerfile: Dockerfile.ghost
+      args:
+        APP_ENV: production
+        PYTHONUNBUFFERED: "1"
+    container_name: ghost-shell-prod
+    profiles: [production]
+    ports:
+      - "5000:5000"
+    environment:
+      GHOST_MODE: production
+      SILENT_MODE: "false"
+      GHOST_AUTH_TOKEN: ${GHOST_AUTH_TOKEN}
+      LOG_LEVEL: INFO
+      DB_PATH: /app/data/alchemy.db
+      ENCRYPTION_KEY_FILE: /app/keys/master.key
+      SECRET_FILE: /app/keys/secret.key
+      RATE_LIMIT: "100 per minute"
+      RATE_LIMIT_BURST: "20"
+      SSL_ENABLED: "true"
+      CORS_ORIGINS: "http://localhost:5000,https://ghost-data-suite.local"
+    volumes:
+      - ./data:/app/data:rw
+      - ./keys:/app/keys:ro
+      - ./logs:/app/logs:rw
+      - ./media:/app/media:rw
+      - ./config:/app/config:ro
+      - ./ssl:/app/ssl:ro
+    networks:
+      - ghost-net
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=/etc/docker/seccomp.json
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/tmp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  alchemist:
+    build:
+      context: .
+      dockerfile: Dockerfile.alchemist
+      args:
+        APP_ENV: production
+        PYTHONUNBUFFERED: "1"
+    container_name: alchemist-core-prod
+    profiles: [production]
+    environment:
+      DB_PATH: /app/data/alchemy.db
+      ENCRYPTION_KEY_FILE: /app/keys/master.key
+      TARGET_URL: ""
+      SCRAPE_INTERVAL: "300"
+      LOG_LEVEL: INFO
+      SILENT_MODE: "false"
+      CONFIG_FILE: /app/config/config.yaml
+      LOG_PATH: /app/logs/alchemist.log
+      GHOST_DATA_DIR: /app/data
+      MEDIA_DIR: /app/media
+    volumes:
+      - ./data:/app/data:rw
+      - ./keys:/app/keys:ro
+      - ./logs:/app/logs:rw
+      - ./media:/app/media:rw
+      - ./config:/app/config:ro
+      - ./hooks:/app/hooks:ro
+    networks:
+      - ghost-net
+    restart: unless-stopped
+    depends_on:
+      ghost-shell:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=/etc/docker/seccomp.json
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/tmp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3; conn=sqlite3.connect('/app/data/alchemy.db'); conn.execute('SELECT 1'); conn.close()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  ghost-monitor:
+    image: prom/prometheus:latest
+    container_name: ghost-monitor-prod
+    profiles: [monitoring]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/data
+      - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    networks:
+      - ghost-net
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/data/prometheus'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ghost-grafana-prod
+    profiles: [monitoring]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_XSRF_PROTECTION: "true"
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+      - ./monitoring/grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
+    networks:
+      - ghost-net
+    restart: unless-stopped
+    depends_on:
+      ghost-monitor:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  nginx:
+    image: nginx:alpine
+    container_name: ghost-nginx-prod
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - ./data:/var/www/html:ro
+    networks:
+      - ghost-net
+    restart: unless-stopped
+    depends_on:
+      ghost-shell:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  ghost-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+
+volumes:
+  ghost-data:
+    driver: local
+  ghost-keys:
+    driver: local
+  ghost-logs:
+    driver: local

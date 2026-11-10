@@ -1,0 +1,33 @@
+FROM alpine:3.18
+
+LABEL maintainer="ghost-data-suite"
+ENV GHOST_MODE=standard \
+    SILENT_MODE=false
+
+RUN apk add --no-cache \
+    openssh-server \
+    python3 \
+    py3-pip \
+    curl \
+    wget \
+    tzdata \
+    sqlite-libs \
+    shadow \
+    && rm -rf /var/cache/apk/*
+
+RUN mkdir -p /var/run/sshd \
+    && echo "root:password" | chpasswd \
+    && mkdir -p /app /data /keys /logs /scripts
+
+COPY scripts/entrypoint.sh /scripts/entrypoint.sh
+COPY src/ghost_server.py /app/src/ghost_server.py
+COPY dashboard.html /app/dashboard.html
+COPY requirements.ghost.txt /app/requirements.txt
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+EXPOSE 22 5000
+
+CMD ["/scripts/entrypoint.sh"]

@@ -1,0 +1,17 @@
+# Ghost-Data Suite Defaults
+# These can be overridden via environment variables.
+
+auth:
+  token: ""
+
+ghost_server:
+  port: 5000
+  ssh_port: 2222
+  secret_file: "/app/keys/secret.key"
+
+alchemist:
+  targets: []
+  rotate_headers: true
+
+monitoring:
+  enabled: false

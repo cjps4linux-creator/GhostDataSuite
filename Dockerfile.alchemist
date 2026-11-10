@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+LABEL maintainer="ghost-data-suite"
+ENV DB_PATH=/app/data/alchemy.db \
+    ENCRYPTION_KEY_FILE=/app/keys/master.key \
+    LOG_LEVEL=INFO
+
+WORKDIR /app
+
+COPY requirements.alchemist.txt /app/requirements.alchemist.txt
+RUN pip install --no-cache-dir -r /app/requirements.alchemist.txt
+RUN playwright install --with-deps chromium
+
+COPY --chown=root:root src/scraper.py /app/src/scraper.py
+COPY --chown=root:root hooks /app/hooks
+
+RUN mkdir -p /app/data /app/keys /app/logs /app/tmp
+
+EXPOSE 8080
+
+CMD ["python", "src/scraper.py"]

@@ -1,0 +1,53 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+credentials.json
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.lnk
+.vscode/
+.idea/
+
+# Encryption keys — never commit
+keys/
+!keys/.gitkeep
+
+# Captured data and databases
+data/
+data-volume-backup/
+
+# Backups containing key material
+ghost-backup.zip
+backups/
+
+# Logs
+logs/
+*.log
+
+# Scraped media
+media/
+
+# Deployment-specific env (template lives in .env.example)
+.env.production
+.env.*.production
+
+# Stray shell artifacts
+]+
