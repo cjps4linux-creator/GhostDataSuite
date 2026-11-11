@@ -1,6 +1,6 @@
 # Ghost Data Suite  -  runtime dependencies (pinned exactly)
 flask==3.0.0
-cryptography==42.0.8
+cryptography==50.0.0
 flask-limiter==3.5.0
 redis==5.2.0
 rq==1.11.1
