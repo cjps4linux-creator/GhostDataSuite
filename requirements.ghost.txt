@@ -11,7 +11,7 @@ python-dateutil==2.9.0.post0
 prometheus-client==0.21.1
 flask-socketio==5.3.6
 gunicorn==22.0.0
-eventlet==0.40.3
+eventlet==0.41.3
 playwright==1.49.0
 alembic==1.13.1
 opentelemetry-sdk==1.31.0
