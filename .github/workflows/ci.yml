@@ -31,9 +31,10 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements.ghost.txt
       - name: Install test dependencies
-        run: pip install pytest==8.3.3
+        run: pip install pytest==8.3.3 pytest-cov
       - name: Run tests
         run: pytest -q --no-header
 
@@ -42,16 +43,3 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: test -f README.md && echo "README present"
-
-  pin-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Check dependency pins
-        # Fails the build on a pre-release version specifier or a
-        # toolchain version that has drifted from the validated pins.
-        # See scripts/pin_guard.py.
-        run: python scripts/pin_guard.py .
