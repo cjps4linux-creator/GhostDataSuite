@@ -52,7 +52,8 @@ os.environ["LOG_PATH"] = _sandbox_path("logs", "alchemist.log")
 os.environ["MEDIA_DIR"] = _sandbox_path("media")
 os.environ["MEDIA_ROOT"] = _sandbox_path("media")
 os.environ["GHOST_DATA_DIR"] = _sandbox_path("data")
-os.environ["GHOST_AUTH_TOKEN"] = ""
+os.environ["GHOST_AUTH_TOKEN"] = "test-token-12345"
+os.environ["SECRET_KEY"] = "test-secret-key-do-not-use-in-production"
 os.environ["LOG_LEVEL"] = "WARNING"
 
 # ---------------------------------------------------------------------------
@@ -86,9 +87,9 @@ def sandbox() -> Path:
     return SANDBOX
 
 
-@pytest.fixture(params=["scraper", "ghost_server"])
+@pytest.fixture(params=["security"])
 def guard_module(request):
-    """Both SSRF guards under test, parameterised over the implementing module."""
+    """The single SSRF guard, implemented once in src/security.py."""
     return importlib.import_module(request.param)
 
 

@@ -9,6 +9,7 @@ services:
         APP_ENV: production
         PYTHONUNBUFFERED: "1"
     container_name: ghost-shell-prod
+    user: "1000:1000"
     profiles: [production]
     ports:
       - "5000:5000"
@@ -22,6 +23,7 @@ services:
       SECRET_FILE: /app/keys/secret.key
       RATE_LIMIT: "100 per minute"
       RATE_LIMIT_BURST: "20"
+      REDIS_URL: redis://ghost-redis:6379/0
       SSL_ENABLED: "true"
       CORS_ORIGINS: "http://localhost:5000,https://ghost-data-suite.local"
     volumes:
@@ -64,6 +66,7 @@ services:
         APP_ENV: production
         PYTHONUNBUFFERED: "1"
     container_name: alchemist-core-prod
+    user: "1000:1000"
     profiles: [production]
     environment:
       DB_PATH: /app/data/alchemy.db
@@ -114,6 +117,7 @@ services:
   ghost-monitor:
     image: prom/prometheus:latest
     container_name: ghost-monitor-prod
+    user: "1000:1000"
     profiles: [monitoring]
     ports:
       - "9090:9090"
@@ -141,6 +145,7 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: ghost-grafana-prod
+    user: "1000:1000"
     profiles: [monitoring]
     ports:
       - "3000:3000"
@@ -170,6 +175,7 @@ services:
   nginx:
     image: nginx:alpine
     container_name: ghost-nginx-prod
+    user: "1000:1000"
     ports:
       - "80:80"
       - "443:443"
@@ -192,6 +198,85 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: ghost-redis-prod
+    user: "1000:1000"
+    profiles: [production]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  rq-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.ghost
+      args:
+        APP_ENV: production
+        PYTHONUNBUFFERED: "1"
+    container_name: ghost-rq-worker
+    user: "1000:1000"
+    profiles: [production]
+    environment:
+      GHOST_MODE: production
+      SILENT_MODE: "false"
+      GHOST_AUTH_TOKEN: ${GHOST_AUTH_TOKEN}
+      LOG_LEVEL: INFO
+      DB_PATH: /app/data/alchemy.db
+      ENCRYPTION_KEY_FILE: /app/keys/master.key
+      SECRET_FILE: /app/keys/secret.key
+      REDIS_URL: redis://ghost-redis:6379/0
+      QUEUE_NAME: ghost-scrapes
+      GHOST_SERVER_URL: http://ghost-shell:5000
+      LOG_PATH: /app/logs/rq-worker.log
+      JSON_LOGS: "true"
+    volumes:
+      - ./data:/app/data:rw
+      - ./keys:/app/keys:ro
+      - ./logs:/app/logs:rw
+      - ./media:/app/media:rw
+      - ./config:/app/config:ro
+      - ./ssl:/app/ssl:ro
+    networks:
+      - ghost-net
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=/etc/docker/seccomp.json
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/tmp
+    command: ["python", "-m", "src.tasks"]
+    depends_on:
+      ghost-redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
 
 networks:
   ghost-net:

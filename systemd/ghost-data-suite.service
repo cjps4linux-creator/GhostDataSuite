@@ -1,0 +1,27 @@
+[Unit]
+Description=Ghost-Data Suite - AI Engineering Scraping Platform
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=1000
+Group=1000
+WorkingDirectory=/opt/ghost-data-suite
+# Secrets must be provided via environment or .env file — never hardcoded here.
+EnvironmentFile=-/opt/ghost-data-suite/.env
+Environment=GHOST_PORT=5000
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/ghost-data-suite/.cache/ms-playwright
+Environment=BACKUP_INTERVAL_SEC=86400
+Environment=BACKUP_KEEP=7
+ExecStart=/opt/ghost-data-suite/venv/bin/python src/ghost_server.py
+Restart=always
+RestartSec=5
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ghost-data-suite/data /opt/ghost-data-suite/keys /opt/ghost-data-suite/logs /opt/ghost-data-suite/media /opt/ghost-data-suite/backups
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

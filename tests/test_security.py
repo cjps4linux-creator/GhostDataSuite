@@ -8,9 +8,8 @@ Every test in this module is hermetic:
 * no browser, GUI or subprocess server is started (the single subprocess test
   stubs out the SocketIO ``run`` method so nothing binds a socket).
 
-The allow/deny matrix is exercised against *both* implementations of the
-guard -- ``src/scraper.py`` and ``src/ghost_server.py`` -- because the two
-modules ship duplicate copies of the same SSRF check and must not drift.
+The allow/deny matrix is exercised against the single SSRF guard implemented
+in ``src/security.py``.
 """
 
 from __future__ import annotations
@@ -113,7 +112,7 @@ NON_STRING_URLS = [
 # ---------------------------------------------------------------------------
 # The allow-list itself
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("module_name", ["scraper", "ghost_server"])
+@pytest.mark.parametrize("module_name", ["security"])
 def test_allowed_schemes_are_http_and_https(module_name):
     module = pytest.importorskip(module_name)
     assert module.ALLOWED_URL_SCHEMES == ("http", "https")
@@ -121,79 +120,69 @@ def test_allowed_schemes_are_http_and_https(module_name):
 
 @pytest.mark.parametrize("url", ALLOWED_URLS)
 def test_allowed_urls_are_accepted(guard_module, url):
-    assert guard_module._is_allowed_url(url) is True
+    assert guard_module.is_allowed_url(url) is True
 
 
 @pytest.mark.parametrize("url", DENIED_URLS)
 def test_denied_urls_are_rejected(guard_module, url):
-    assert guard_module._is_allowed_url(url) is False
+    assert guard_module.is_allowed_url(url) is False
 
 
 @pytest.mark.parametrize("url", NON_STRING_URLS)
 def test_non_string_urls_are_rejected(guard_module, url):
-    assert guard_module._is_allowed_url(url) is False
+    assert guard_module.is_allowed_url(url) is False
 
 
 @pytest.mark.parametrize("url", ALLOWED_URLS + DENIED_URLS)
 def test_guard_never_raises_for_any_input(guard_module, url):
     """The guard is a filter, not a parser: it must always return a bool."""
-    assert isinstance(guard_module._is_allowed_url(url), bool)
+    assert isinstance(guard_module.is_allowed_url(url), bool)
 
 
 def test_uppercase_scheme_is_allowed_because_scheme_is_lowercased(guard_module):
-    assert guard_module._is_allowed_url("HTTP://example.com") is True
-    assert guard_module._is_allowed_url("HtTpS://example.com") is True
+    assert guard_module.is_allowed_url("HTTP://example.com") is True
+    assert guard_module.is_allowed_url("HtTpS://example.com") is True
 
 
 def test_whitespace_padded_url_is_allowed(guard_module):
-    assert guard_module._is_allowed_url("   https://example.com/path   ") is True
+    assert guard_module.is_allowed_url("   https://example.com/path   ") is True
 
 
 def test_url_with_credentials_is_allowed(guard_module):
-    assert guard_module._is_allowed_url("https://user:pass@example.com") is True
+    assert guard_module.is_allowed_url("https://user:pass@example.com") is True
 
 
 def test_url_with_port_is_allowed(guard_module):
-    assert guard_module._is_allowed_url("http://example.com:8080/x") is True
+    assert guard_module.is_allowed_url("http://example.com:8080/x") is True
 
 
 def test_ipv6_literal_is_allowed(guard_module):
-    assert guard_module._is_allowed_url("http://[::1]:8080/") is True
-
-
-def test_both_guards_agree_on_every_url(guard_module):
-    """scraper.py and ghost_server.py must implement identical semantics."""
-    from conftest import ghost_server, scraper
-
-    for url in ALLOWED_URLS + DENIED_URLS:
-        assert scraper._is_allowed_url(url) == ghost_server._is_allowed_url(url), url
-    for value in NON_STRING_URLS:
-        assert scraper._is_allowed_url(value) == ghost_server._is_allowed_url(value)
+    assert guard_module.is_allowed_url("http://[::1]:8080/") is True
 
 
 def test_host_containing_whitespace_is_accepted_quirk(guard_module):
-    """Documented quirk: the guard only requires a [lorem]-empty netloc.
+    """Documented quirk: the guard only requires an empty netloc.
 
     ``urlparse`` happily returns ``"exa mple.com"`` as the netloc, so the
     guard lets it through.  The request itself still fails later in urllib.
     """
-    assert guard_module._is_allowed_url("http://exa mple.com") is True
+    assert guard_module.is_allowed_url("http://exa mple.com") is True
 
 
 # ---------------------------------------------------------------------------
-# _safe_open must refuse before touching the network
+# safe_open must refuse before touching the network
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("url", DENIED_URLS + NON_STRING_URLS)
 def test_safe_open_raises_value_error_for_denied_urls(guard_module, url, no_network):
     with pytest.raises(ValueError) as excinfo:
-        guard_module._safe_open(url, 5)
+        guard_module.safe_open(url, 5)
     assert "blocked URL scheme" in str(excinfo.value)
     assert no_network == [], "a blocked URL must never reach urllib.request.urlopen"
 
 
 def test_safe_open_blocks_file_scheme_without_reading_the_file(guard_module, no_network):
     with pytest.raises(ValueError):
-        guard_module._safe_open("file:///etc/passwd", 5)
+        guard_module.safe_open("file:///etc/passwd", 5)
     assert no_network == []
 
 
@@ -209,7 +198,7 @@ def test_safe_open_passes_allowed_url_to_urlopen(guard_module, monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
 
-    result = guard_module._safe_open("https://example.com/page", 42)
+    result = guard_module.safe_open("https://example.com/page", 42)
 
     assert result == "sentinel"
     assert recorded["url"] == "https://example.com/page"
@@ -226,7 +215,7 @@ def test_safe_open_uses_custom_headers_when_supplied(guard_module, monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
 
-    guard_module._safe_open("https://example.com/page", 7, headers={"X-Custom": "1"})
+    guard_module.safe_open("https://example.com/page", 7, headers={"X-Custom": "1"})
 
     assert recorded["headers"].get("X-custom") == "1"
     assert "User-agent" not in recorded["headers"]
@@ -259,14 +248,6 @@ def test_protected_endpoints_accept_header_token(client, monkeypatch):
     response = client.get("/status", headers={"X-Ghost-Token": "s3cret-token"})
     assert response.status_code == 200
     assert response.get_json()["service"] == "ghost-server"
-
-
-def test_protected_endpoints_accept_query_token(client, monkeypatch):
-    from conftest import ghost_server
-
-    monkeypatch.setattr(ghost_server, "AUTH_TOKEN", "s3cret-token")
-    response = client.get("/status?token=s3cret-token")
-    assert response.status_code == 200
 
 
 def test_health_endpoint_needs_no_token(client, monkeypatch):
@@ -303,7 +284,7 @@ def seeded_db(tmp_path, monkeypatch):
         store.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS capture_media (
-                [lorem] INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 capture_id INTEGER NOT NULL,
                 url TEXT NOT NULL,
                 category TEXT NOT NULL,
@@ -329,16 +310,22 @@ def seeded_db(tmp_path, monkeypatch):
 
 
 def test_media_download_refuses_file_scheme_row(client, seeded_db, no_network):
-    response = client.get(f"/media/download/{seeded_db}/leak.txt")
+    response = client.get(
+        f"/media/download/{seeded_db}/leak.txt",
+        headers={"X-Ghost-Token": "test-token-12345"},
+    )
     assert response.status_code == 502
-    assert "blocked URL scheme" in response.get_json()["error"]
+    assert "download failed" in response.get_json()["error"]
     assert b"root:" not in response.data
 
 
 def test_public_media_refuses_file_scheme_row(client, seeded_db, no_network):
-    response = client.get(f"/public/media/{seeded_db}/leak.txt")
+    response = client.get(
+        f"/public/media/{seeded_db}/leak.txt",
+        headers={"X-Ghost-Token": "test-token-12345"},
+    )
     assert response.status_code == 502
-    assert "blocked URL scheme" in response.get_json()["error"]
+    assert "download failed" in response.get_json()["error"]
     assert b"root:" not in response.data
 
 
@@ -347,7 +334,10 @@ def test_download_all_zip_skips_blocked_rows(client, seeded_db, no_network):
     import io
     import zipfile
 
-    response = client.get(f"/download/all/{seeded_db}")
+    response = client.get(
+        f"/download/all/{seeded_db}",
+        headers={"X-Ghost-Token": "test-token-12345"},
+    )
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
         assert archive.namelist() == []
@@ -355,7 +345,7 @@ def test_download_all_zip_skips_blocked_rows(client, seeded_db, no_network):
 
 
 def test_download_all_zip_of_a_capture_without_media_is_a_readme(client, seeded_db, monkeypatch):
-    """With no media rows at all the endpoint returns the [content pending] zip."""
+    """With no media rows at all the endpoint returns the readme zip."""
     import io
     import zipfile
 
@@ -367,7 +357,10 @@ def test_download_all_zip_of_a_capture_without_media_is_a_readme(client, seeded_
         connection.commit()
         connection.close()
 
-    response = client.get(f"/download/all/{seeded_db}")
+    response = client.get(
+        f"/download/all/{seeded_db}",
+        headers={"X-Ghost-Token": "test-token-12345"},
+    )
     assert response.status_code == 200
     with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
         assert archive.namelist() == ["README.txt"]
@@ -375,16 +368,21 @@ def test_download_all_zip_of_a_capture_without_media_is_a_readme(client, seeded_
 
 
 def test_captures_endpoint_does_not_leak_plaintext(client, seeded_db):
-    response = client.get("/captures")
+    response = client.get("/captures", headers={"X-Ghost-Token": "test-token-12345"})
     assert response.status_code == 200
     payload = response.get_json()
-    assert len(payload) == 1
-    assert "encrypted" not in payload[0]
-    assert payload[0]["status"] == "ok"
+    assert "captures" in payload
+    assert "meta" in payload
+    assert len(payload["captures"]) == 1
+    assert "encrypted" not in payload["captures"][0]
+    assert payload["captures"][0]["status"] == "ok"
 
 
 def test_decrypt_endpoint_round_trips_encrypted_content(client, seeded_db):
-    response = client.get(f"/captures/{seeded_db}/decrypt")
+    response = client.get(
+        f"/captures/{seeded_db}/decrypt",
+        headers={"X-Ghost-Token": "test-token-12345"},
+    )
     assert response.status_code == 200
     body = response.get_json()
     assert body["content"]["url"] == "https://example.com/page"

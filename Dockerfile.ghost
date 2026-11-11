@@ -4,23 +4,23 @@ LABEL maintainer="ghost-data-suite"
 ENV GHOST_MODE=standard \
     SILENT_MODE=false
 
+# Install runtime dependencies only. No SSH, no unnecessary shells.
 RUN apk add --no-cache \
-    openssh-server \
     python3 \
     py3-pip \
     curl \
-    wget \
     tzdata \
     sqlite-libs \
-    shadow \
     && rm -rf /var/cache/apk/*
 
-RUN mkdir -p /var/run/sshd \
-    && echo "root:password" | chpasswd \
-    && mkdir -p /app /data /keys /logs /scripts
+# Create a non-root user for the application.
+RUN adduser -D -u 1000 ghostuser \
+    && mkdir -p /app /data /keys /logs /media /tmp \
+    && chown -R ghostuser:ghostuser /app /data /keys /logs /media /tmp
 
 COPY scripts/entrypoint.sh /scripts/entrypoint.sh
 COPY src/ghost_server.py /app/src/ghost_server.py
+COPY src/security.py /app/src/security.py
 COPY dashboard.html /app/dashboard.html
 COPY requirements.ghost.txt /app/requirements.txt
 
@@ -28,6 +28,9 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-EXPOSE 22 5000
+# Expose only the application port. SSH is intentionally omitted.
+EXPOSE 5000
+
+USER ghostuser
 
 CMD ["/scripts/entrypoint.sh"]

@@ -12,42 +12,236 @@ Ghost-Data Suite  -  Hardened Ghost Server
 from __future__ import annotations
 
 import os
+import warnings
+warnings.filterwarnings("ignore", message=".*in-memory storage for tracking rate limits.*")
+import sys
 import json
+
+# Optional Redis storage for Flask-Limiter (production)
+try:
+    import redis as _redis  # noqa: F401  (imported to ensure availability)
+except Exception:  # pragma: no cover - redis is optional in local dev
+    _redis = None
 import io
 import csv
 import zipfile
 import logging
 log = logging.getLogger(__name__)
-import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone
 
 import sqlite3
 from cryptography.fernet import Fernet
-from flask import Flask, jsonify, Response, request, send_file
+from flask import Flask, jsonify, Response, request, send_file, stream_with_context
 from flask_limiter import Limiter
 from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
+
+from urllib.parse import urlparse
+from security import safe_open
+
+import threading
+import time as _time
+import zipfile as _zipfile
 
 # ---------------------------------------------------------------------------
-# Config
+# Automated backup scheduler (runs in a background daemon thread)
 # ---------------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = os.getenv("DB_PATH", str(BASE_DIR / "data/alchemy.db"))
-KEY_FILE = os.getenv("ENCRYPTION_KEY_FILE", str(BASE_DIR / "keys/master.key"))
-SECRET_FILE = os.getenv("SECRET_FILE", str(BASE_DIR / "keys/secret.key"))
-CONFIG_FILE = BASE_DIR / "config" / "config.yaml"
-LOG_FILE = BASE_DIR / "logs" / "alchemist.log"
-AUTH_TOKEN = os.getenv("GHOST_AUTH_TOKEN", "")
-if not AUTH_TOKEN and CONFIG_FILE.exists():
+
+_BACKUP_INTERVAL_SEC = int(os.getenv("BACKUP_INTERVAL_SEC", "86400"))  # 24h default
+_BACKUP_KEEP = int(os.getenv("BACKUP_KEEP", "7"))  # keep last N backups
+
+
+def _backup_dir() -> Path:
+    return Path(os.getenv("BACKUP_DIR", str(DATA_DIR / "backups")))
+
+
+def _rotate_backups():
+    """Keep only the most recent _BACKUP_KEEP backup files."""
     try:
-        import yaml
-        cfg = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8")) or {}
-        AUTH_TOKEN = ((cfg.get("auth") or {}).get("token") or "").strip()
+        bdir = _backup_dir()
+        backups = sorted(bdir.glob("ghost-backup-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in backups[_BACKUP_KEEP:]:
+            old.unlink()
     except Exception:
-        AUTH_TOKEN = ""
+        pass
+
+
+def _backup_once() -> None:
+    """Perform one backup of DB + encryption key + logs."""
+    try:
+        bdir = _backup_dir()
+        bdir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        backup_path = bdir / f"ghost-backup-{ts}.zip"
+        with _zipfile.ZipFile(backup_path, "w", _zipfile.ZIP_DEFLATED) as zf:
+            if os.path.exists(DB_PATH):
+                zf.write(DB_PATH, "alchemy.db")
+            if os.path.exists(KEY_FILE):
+                zf.write(KEY_FILE, "master.key")
+            if os.path.exists(LOG_FILE):
+                zf.write(LOG_FILE, "alchemist.log")
+        _rotate_backups()
+        log.info("Automated backup created | path=%s", backup_path)
+    except Exception as exc:
+        log.warning("Automated backup failed: %s", exc)
+
+
+def _backup_loop() -> None:
+    """Background loop: run _backup_once every BACKUP_INTERVAL_SEC seconds."""
+    while True:
+        _time.sleep(_BACKUP_INTERVAL_SEC)
+        _backup_once()
+
+
+# Start the backup scheduler as a daemon thread (only when running as main app)
+_backup_thread: threading.Thread | None = None
+
+# RQ task queue — scrape jobs are enqueued here and processed by worker(s)
+try:
+    from redis import Redis as _Redis
+    from rq import Queue as _RQQueue
+    _redis_client = _Redis.from_url(
+        os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        socket_timeout=5,
+        socket_connect_timeout=5,
+    )
+    # Ping Redis to verify it's actually reachable; if not, fall back to None
+    # so the scrape endpoint can run synchronously instead of failing with 500.
+    _redis_client.ping()
+    queue = _RQQueue("ghost-scrapes", connection=_redis_client)
+except Exception:  # pragma: no cover - Redis optional in local dev
+    queue = None
+    log.debug("Redis not available at %s; scrape jobs will run synchronously",
+                os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+
+# ---------------------------------------------------------------------------#
+# Config
+# ---------------------------------------------------------------------------#
+
+def _resource_dir():
+    """Directory containing bundled resources (dashboard.html, static/, config/).
+
+    When running as a PyInstaller bundle, these are extracted to sys._MEIPASS.
+    When running from source, this is the project root.
+    """
+    if getattr(sys, "_MEIPASS", None):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent.parent
+
+
+def _data_dir():
+    """Writable directory for user data (database, keys, logs, media).
+
+    Defaults to the current working directory so the .exe can be run from
+    any folder and data lands next to it.
+    """
+    return Path.cwd()
+
+
+RESOURCE_DIR = _resource_dir()
+DATA_DIR = _data_dir()
+
+BASE_DIR = RESOURCE_DIR  # kept for backwards compatibility in imports
+DB_PATH = os.getenv("DB_PATH", str(DATA_DIR / "data/alchemy.db"))
+KEY_FILE = os.getenv("ENCRYPTION_KEY_FILE", str(DATA_DIR / "keys/master.key"))
+SECRET_FILE = os.getenv("SECRET_FILE", str(DATA_DIR / "keys/secret.key"))
+CONFIG_FILE = RESOURCE_DIR / "config" / "config.yaml"
+LOG_FILE = DATA_DIR / "logs" / "alchemist.log"
+
+# Playwright browsers path — needed for scraping in PyInstaller .exe bundles
+# Set to %LOCALAPPDATA%\ms-playwright by the launcher; fall back to common locations
+if not os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
+    _default_browser_paths = [
+        os.path.expandvars(r"%LOCALAPPDATA%\ms-playwright"),
+        os.path.expanduser("~/.cache/ms-playwright"),
+    ]
+    for _p in _default_browser_paths:
+        if os.path.isdir(_p):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _p
+            log.info("Playwright browsers path set to %s", _p)
+            break
+
+# Startup browser check — verify Playwright can find a Chromium browser.
+# If none is found, scraping will fail at runtime with an opaque error;
+# surface a clear warning now instead.
+_browser_check_ok = False
+try:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        _browsers = p.chromium.executable_path
+        if _browsers and os.path.exists(_browsers):
+            _browser_check_ok = True
+            log.info("Playwright Chromium found at %s", _browsers)
+except Exception as _exc:  # pragma: no cover - best-effort startup check
+    log.warning("Playwright browser check failed: scraping will not work", exc_info=_exc)
+
+if not _browser_check_ok:
+    log.warning(
+        "No Playwright Chromium browser detected. Set PLAYWRIGHT_BROWSERS_PATH "
+        "or run 'playwright install chromium'. Scraping will fail until resolved."
+    )
+
+# ---------------------------------------------------------------------------
+# Structured JSON logging
+# ---------------------------------------------------------------------------
+from logging_config import setup_json_logging
+
+log = setup_json_logging(
+    "ghost-server",
+    log_file=str(LOG_FILE),
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    json_logs=os.getenv("JSON_LOGS", "true").lower() == "true",
+)
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry distributed tracing
+# ---------------------------------------------------------------------------
+_otel = None
+try:
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.flask import FlaskInstrumentor
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
+    otel_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if otel_endpoint:
+        provider = TracerProvider()
+        processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=otel_endpoint))
+        provider.add_span_processor(processor)
+        trace.set_tracer_provider(provider)
+
+        RequestsInstrumentor().instrument()
+        _otel = trace.get_tracer(__name__)
+        log.info("OpenTelemetry tracing enabled", endpoint=otel_endpoint)
+    else:
+        log.info("OpenTelemetry tracing disabled (OTEL_EXPORTER_OTLP_ENDPOINT not set)")
+except Exception as exc:  # pragma: no cover - OTel is optional
+    log.debug("OpenTelemetry not available: %s", str(exc))
+    _otel = None
+
+# Module-level tracer for custom spans
+tracer = _otel
+
+_AUTH_TOKEN_FROM_ENV = bool(os.getenv("GHOST_AUTH_TOKEN"))
+AUTH_TOKEN = os.getenv("GHOST_AUTH_TOKEN")
+if not AUTH_TOKEN:
+    import secrets
+    AUTH_TOKEN = secrets.token_hex(16)
+    log.info("GHOST_AUTH_TOKEN not set; auto-generated ephemeral token")
+
+_SECRET_KEY_FROM_ENV = bool(os.getenv("SECRET_KEY"))
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    import secrets
+    SECRET_KEY = secrets.token_hex(32)
+    log.info("SECRET_KEY not set; auto-generated ephemeral key")
 
 RATE_LIMIT = os.getenv("RATE_LIMIT", "300 per minute")
+REDIS_URL = os.getenv("REDIS_URL")
 
 
 def _rate_limit_key():
@@ -69,12 +263,43 @@ class LocalhostExemptLimiter(Limiter):
         return False
 
 
-limiter = LocalhostExemptLimiter(key_func=_rate_limit_key, default_limits=[RATE_LIMIT])
+limiter_kwargs = {"key_func": _rate_limit_key, "default_limits": [RATE_LIMIT]}
+if REDIS_URL:
+    limiter_kwargs["storage_uri"] = REDIS_URL
+    limiter_kwargs["storage_options"] = {"socket_timeout": 5, "socket_connect_timeout": 5}
 
-app = Flask(__name__)
-app.config["SECRET_KEY"] = "ghost-data-suite"
+limiter = LocalhostExemptLimiter(**limiter_kwargs)
+
+app = Flask(__name__, static_folder=str(RESOURCE_DIR / "static"), static_url_path="/static")
+app.config["SECRET_KEY"] = SECRET_KEY
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 limiter.init_app(app)
+
+# Flask instrumentation for OpenTelemetry (must run after app is created)
+if tracer:
+    from opentelemetry.instrumentation.flask import FlaskInstrumentor
+
+    FlaskInstrumentor().instrument_app(app)
+
+
+@app.after_request
+def _set_auth_cookie(response):
+    """Set an httpOnly cookie when a valid X-Ghost-Token header is sent.
+
+    This lets clients authenticate once via the header and thereafter rely on
+    the cookie, so tokens never need to appear in URLs or localStorage.
+    """
+    token = request.headers.get("X-Ghost-Token")
+    if token and token == AUTH_TOKEN:
+        response.set_cookie(
+            "ghost_token",
+            token,
+            httponly=True,
+            samesite="Lax",
+            path="/",
+        )
+    return response
+
 
 # ---------------------------------------------------------------------------
 # Metrics
@@ -93,6 +318,8 @@ def _db():
         return None
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -103,12 +330,23 @@ def _load_fernet():
 
 
 def _auth_required():
-    if not AUTH_TOKEN:
-        return None
-    token = request.headers.get("X-Ghost-Token") or request.args.get("token") or ""
+    token = request.headers.get("X-Ghost-Token") or request.cookies.get("ghost_token") or ""
     if token != AUTH_TOKEN:
         return jsonify({"error": "unauthorized"}), 401
     return None
+
+
+def _error_response(message: str, status: int = 500, log_exc: Exception | None = None):
+    """Return a sanitized error response to the client.
+
+    Full tracebacks are logged server-side only; clients never see
+    file paths, line numbers, or exception internals.
+    """
+    if log_exc is not None:
+        log.exception("Request failed: %s", message, exc_info=log_exc)
+    else:
+        log.error("Request failed: %s", message)
+    return jsonify({"ok": False, "error": message}), status
 
 
 def _emit_log(line: str):
@@ -124,12 +362,48 @@ def _emit_log(line: str):
 
 @app.get("/")
 def dashboard():
-    html_path = BASE_DIR / "dashboard.html"
+    html_path = RESOURCE_DIR / "dashboard.html"
     if not html_path.exists():
         return Response("<h1>Ghost-Data Suite</h1><p>dashboard.html missing</p>", mimetype="text/html")
     resp = Response(html_path.read_text(encoding="utf-8"), mimetype="text/html")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
+
+
+@app.get("/static/auth-config.js")
+def serve_auth_config():
+    """Serve auth config JS.
+
+    When GHOST_AUTH_TOKEN is set via env var (launcher), serve the
+    runtime-written auth-config.js file. When auto-generated (direct .exe
+    launch), serve the token directly so it always matches AUTH_TOKEN.
+    """
+    # When token was auto-generated (no env var), serve it directly
+    # so it always matches the server's AUTH_TOKEN
+    if not _AUTH_TOKEN_FROM_ENV:
+        return (
+            f"window.GHOST_AUTH_TOKEN = '{AUTH_TOKEN}';"
+            f"window.GHOST_SESSION_TOKEN = '{AUTH_TOKEN}';",
+            200,
+            {"Content-Type": "application/javascript", "Cache-Control": "no-cache"},
+        )
+    # Token from env var — serve the file written by the launcher
+    runtime_path = DATA_DIR / "static" / "auth-config.js"
+    if runtime_path.exists():
+        response = send_file(str(runtime_path), mimetype="application/javascript")
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+    bundled_path = RESOURCE_DIR / "static" / "auth-config.js"
+    if bundled_path.exists():
+        response = send_file(str(bundled_path), mimetype="application/javascript")
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+    return (
+        f"window.GHOST_AUTH_TOKEN = '{AUTH_TOKEN}';"
+        f"window.GHOST_SESSION_TOKEN = '{AUTH_TOKEN}';",
+        200,
+        {"Content-Type": "application/javascript", "Cache-Control": "no-cache"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -204,22 +478,27 @@ def list_captures():
         return auth_err
     q = request.args.get("q", "")
     status = request.args.get("status", "")
-    limit = min(int(request.args.get("limit", 200)), 500)
+    page = max(int(request.args.get("page", 1)), 1)
+    per_page = min(max(int(request.args.get("per_page", 20)), 1), 100)
+    offset = (page - 1) * per_page
     conn = _db()
     if not conn:
-        return jsonify([])
+        return jsonify({"captures": [], "meta": {"total": 0, "page": page, "per_page": per_page}})
     try:
-        sql = "SELECT [lorem], created_at, url_hash, status, encrypted FROM captures WHERE 1=1"
+        sql_count = "SELECT COUNT(*) FROM captures WHERE 1=1"
+        sql = "SELECT id, created_at, url_hash, status, encrypted FROM captures WHERE 1=1"
         params = []
         if q:
+            sql_count += " AND url_hash LIKE ?"
             sql += " AND url_hash LIKE ?"
             params.append(f"%{q}%")
         if status:
+            sql_count += " AND status = ?"
             sql += " AND status = ?"
             params.append(status)
-        sql += " ORDER BY [lorem] DESC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(sql, params).fetchall()
+        total = conn.execute(sql_count, params).fetchone()[0]
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        rows = conn.execute(sql, params + [per_page, offset]).fetchall()
         fernet = _load_fernet()
         out = []
         for r in rows:
@@ -232,9 +511,60 @@ def list_captures():
             except Exception:
                 item["url"] = ""
             out.append(item)
-        return jsonify(out)
+        return jsonify({
+            "captures": out,
+            "meta": {"total": total, "page": page, "per_page": per_page},
+        })
     finally:
         conn.close()
+
+
+@app.post("/captures/bulk")
+def bulk_delete_captures():
+    auth_err = _auth_required()
+    if auth_err:
+        return auth_err
+    data = request.get_json(silent=True) or {}
+    ids = data.get("ids", [])
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"ok": False, "error": "ids list required"}), 400
+    conn = _db()
+    if not conn:
+        return jsonify({"ok": False, "error": "database missing"}), 500
+    try:
+        placeholders = ",".join("?" for _ in ids)
+        cur = conn.execute(
+            f"DELETE FROM captures WHERE id IN ({placeholders})", ids
+        )
+        deleted = cur.rowcount
+        conn.execute("DELETE FROM capture_media WHERE capture_id IN (" + placeholders + ")", ids)
+        conn.commit()
+        CAPTURE_COUNT.set(conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
+        return jsonify({"ok": True, "deleted": deleted})
+    finally:
+        conn.close()
+
+
+@app.post("/notify/capture")
+def notify_capture():
+    """Endpoint called by the scraper after storing a capture.
+
+    Emits a SocketIO ``capture_created`` event so connected dashboards
+    can refresh in real time without polling.
+    """
+    auth_err = _auth_required()
+    if auth_err:
+        return auth_err
+    data = request.get_json(silent=True) or {}
+    capture_id = data.get("id")
+    url = data.get("url", "")
+    status = data.get("status", "ok")
+    socketio.emit("capture_created", {"id": capture_id, "url": url, "status": status})
+    conn2 = _db()
+    if conn2:
+        CAPTURE_COUNT.set(conn2.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
+        conn2.close()
+    return jsonify({"ok": True})
 
 
 @app.get("/captures/<int:capture_id>/decrypt")
@@ -252,7 +582,7 @@ def decrypt_capture(capture_id: int):
         DECRYPT_REQUESTS.labels(status="error").inc()
         return jsonify({"error": "database missing"}), 404
     try:
-        row = conn.execute("SELECT [lorem], created_at, url_hash, encrypted, status FROM captures WHERE [lorem] = ?", (capture_id,)).fetchone()
+        row = conn.execute("SELECT id, created_at, url_hash, encrypted, status FROM captures WHERE id = ?", (capture_id,)).fetchone()
         if not row:
             DECRYPT_REQUESTS.labels(status="not_found").inc()
             return jsonify({"error": "capture not found"}), 404
@@ -267,7 +597,7 @@ def decrypt_capture(capture_id: int):
         except Exception:
             parsed = {"raw": plaintext}
         return jsonify({
-            "[lorem]": row["[lorem]"],
+            "id": row["id"],
             "created_at": row["created_at"],
             "url_hash": row["url_hash"],
             "status": row["status"],
@@ -287,45 +617,13 @@ def list_capture_media(capture_id: int):
         return jsonify([])
     try:
         rows = conn.execute(
-            "SELECT [lorem], url, category, filename, local_path, content_type, size_bytes, created_at FROM capture_media WHERE capture_id = ? ORDER BY [lorem] ASC",
+            "SELECT id, url, category, filename, local_path, content_type, size_bytes, created_at FROM capture_media WHERE capture_id = ? ORDER BY id ASC",
             (capture_id,),
         ).fetchall()
         return jsonify([dict(r) for r in rows])
     finally:
         conn.close()
 
-
-from urllib.parse import urlparse
-
-# ---------------------------------------------------------------------------
-# SSRF guard
-# ---------------------------------------------------------------------------
-# Every outbound fetch goes through this check. Without it, a stored URL of
-# `file:///etc/passwd` or `gopher://...` would let a request reach local
-# resources or arbitrary protocol handlers (bandit B310, CWE-22).
-
-ALLOWED_URL_SCHEMES = ("http", "https")
-
-
-def _is_allowed_url(url: str) -> bool:
-    """Return True only for absolute http(s) URLs with a host."""
-    if not url or not isinstance(url, str):
-        return False
-    try:
-        parsed = urlparse(url.strip())
-    except ValueError:
-        return False
-    if parsed.scheme.lower() not in ALLOWED_URL_SCHEMES:
-        return False
-    return bool(parsed.netloc)
-
-
-def _safe_open(url: str, timeout: int, headers: dict | None = None):
-    """Open a URL after validating the scheme, or raise ValueError."""
-    if not _is_allowed_url(url):
-        raise ValueError(f"blocked URL scheme or missing host: {url!r}")
-    req = urllib.request.Request(url, headers=headers or {"User-Agent": "GhostDataSuite/1.0"})
-    return urllib.request.urlopen(req, timeout=timeout)  # nosec B310 - scheme and host are validated by _is_allowed_url() above
 
 MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", "/app/media"))
 
@@ -428,19 +726,29 @@ def public_media(capture_id: int, filename: str):
         }.get(ext, "application/octet-stream")
 
     try:
-        with _safe_open(source_url, 90) as upstream:
-            data = upstream.read()
-            return Response(
-                data,
-                status=200,
-                content_type=content_type,
-                headers={
-                    "Cache-Control": "no-store",
-                    "Access-Control-Allow-Origin": "*",
-                },
-            )
+        upstream = safe_open(source_url, 90)
+
+        def generate():
+            try:
+                while True:
+                    chunk = upstream.read(8192)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                upstream.close()
+
+        return Response(
+            stream_with_context(generate()),
+            status=200,
+            content_type=content_type,
+            headers={
+                "Cache-Control": "no-store",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
     except Exception as exc:
-        return jsonify({"ok": False, "error": f"download failed: {exc}"}), 502
+        return _error_response("download failed", 502, exc)
 
 
 @app.get("/download/all/<int:capture_id>")
@@ -455,7 +763,7 @@ def download_all_media(capture_id: int):
         return jsonify({"ok": False, "error": "no db"}), 500
     try:
         rows = conn.execute(
-            "SELECT filename, url, content_type, local_path FROM capture_media WHERE capture_id = ? ORDER BY [lorem] ASC",
+            "SELECT filename, url, content_type, local_path FROM capture_media WHERE capture_id = ? ORDER BY id ASC",
             (capture_id,),
         ).fetchall()
         if not rows:
@@ -471,10 +779,9 @@ def download_all_media(capture_id: int):
     finally:
         conn.close()
 
-    buf = io.BytesIO()
-    added = 0
+    tmp_path = Path(f"/tmp/ghost-export-{capture_id}-{os.getpid()}.zip")
     try:
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for row in rows:
                 filename = row["filename"]
                 local_path = row["local_path"] or ""
@@ -489,25 +796,47 @@ def download_all_media(capture_id: int):
                     data = None
                 if data is None:
                     try:
-                        with _safe_open(source_url, 10) as upstream:
-                            data = upstream.read()
+                        upstream = safe_open(source_url, 10)
+                        chunks = []
+                        while True:
+                            chunk = upstream.read(8192)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                        upstream.close()
+                        data = b"".join(chunks)
                     except Exception as exc:
                         log.warning("Zip skip %s: %s", source_url, exc)
                         continue
                 try:
                     zf.writestr(filename, data)
-                    added += 1
                 except Exception:
                     pass
-        buf.seek(0)
+
+        def generate():
+            with open(tmp_path, "rb") as f:
+                while True:
+                    chunk = f.read(8192)
+                    if not chunk:
+                        break
+                    yield chunk
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
         return Response(
-            buf.getvalue(),
+            generate(),
             status=200,
             mimetype="application/zip",
             headers={"Content-Disposition": f'attachment; filename="capture-{capture_id}-media.zip"'},
         )
     except Exception as exc:
-        return jsonify({"ok": False, "error": f"zip failed: {exc}"}), 502
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return _error_response("zip failed", 502, exc)
 
 
 @app.get("/media/download/<int:capture_id>/<path:filename>")
@@ -531,14 +860,29 @@ def download_media(capture_id: int, filename: str):
         conn.close()
 
     try:
-        with _safe_open(source_url, 90) as upstream:
-            data = upstream.read()
-            return Response(data, status=200, content_type=content_type, headers={
+        upstream = safe_open(source_url, 90)
+
+        def generate():
+            try:
+                while True:
+                    chunk = upstream.read(8192)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                upstream.close()
+
+        return Response(
+            stream_with_context(generate()),
+            status=200,
+            content_type=content_type,
+            headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Cache-Control": "no-store",
-            })
+            },
+        )
     except Exception as exc:
-        return jsonify({"ok": False, "error": f"download failed: {exc}"}), 502
+        return _error_response("download failed", 502, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -556,19 +900,19 @@ def export_json(capture_id: int | None = None):
         return jsonify([])
     try:
         if capture_id is not None:
-            rows = conn.execute("SELECT [lorem], created_at, url_hash, status FROM captures WHERE [lorem] = ?", (capture_id,)).fetchall()
+            rows = conn.execute("SELECT id, created_at, url_hash, status FROM captures WHERE id = ?", (capture_id,)).fetchall()
         else:
-            rows = conn.execute("SELECT [lorem], created_at, url_hash, status FROM captures ORDER BY [lorem] DESC").fetchall()
+            rows = conn.execute("SELECT id, created_at, url_hash, status FROM captures ORDER BY id DESC").fetchall()
         fernet = _load_fernet()
         out = []
         for r in rows:
-            blob = conn.execute("SELECT encrypted FROM captures WHERE [lorem] = ?", (r["[lorem]"],)).fetchone()["encrypted"]
+            blob = conn.execute("SELECT encrypted FROM captures WHERE id = ?", (r["id"],)).fetchone()["encrypted"]
             try:
                 plaintext = fernet.decrypt(blob).decode("utf-8")
             except Exception:
                 plaintext = ""
             out.append({
-                "[lorem]": r["[lorem]"],
+                "id": r["id"],
                 "created_at": r["created_at"],
                 "status": r["status"],
                 "content": json.loads(plaintext) if plaintext else None,
@@ -590,21 +934,21 @@ def export_csv(capture_id: int | None = None):
         return Response("", mimetype="text/csv")
     try:
         if capture_id is not None:
-            rows = conn.execute("SELECT [lorem], created_at, url_hash, status FROM captures WHERE [lorem] = ?", (capture_id,)).fetchall()
+            rows = conn.execute("SELECT id, created_at, url_hash, status FROM captures WHERE id = ?", (capture_id,)).fetchall()
         else:
-            rows = conn.execute("SELECT [lorem], created_at, url_hash, status FROM captures ORDER BY [lorem] DESC").fetchall()
+            rows = conn.execute("SELECT id, created_at, url_hash, status FROM captures ORDER BY id DESC").fetchall()
         out = io.StringIO()
         writer = csv.writer(out)
-        writer.writerow(["[lorem]", "created_at", "url_hash", "status", "title", "url"])
+        writer.writerow(["id", "created_at", "url_hash", "status", "title", "url"])
         for r in rows:
             try:
-                blob = conn.execute("SELECT encrypted FROM captures WHERE [lorem] = ?", (r["[lorem]"],)).fetchone()["encrypted"]
+                blob = conn.execute("SELECT encrypted FROM captures WHERE id = ?", (r["id"],)).fetchone()["encrypted"]
                 plaintext = _load_fernet().decrypt(blob).decode("utf-8") if _load_fernet() else ""
                 parsed = json.loads(plaintext) if plaintext else {}
                 content = parsed.get("content", parsed)
-                writer.writerow([r["[lorem]"], r["created_at"], r["url_hash"], r["status"], content.get("title", ""), content.get("url", "")])
+                writer.writerow([r["id"], r["created_at"], r["url_hash"], r["status"], content.get("title", ""), content.get("url", "")])
             except Exception:
-                writer.writerow([r["[lorem]"], r["created_at"], r["url_hash"], r["status"], "", ""])
+                writer.writerow([r["id"], r["created_at"], r["url_hash"], r["status"], "", ""])
         return Response(out.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=ghost-export.csv"})
     finally:
         conn.close()
@@ -636,7 +980,7 @@ def clear_logs():
             LOG_FILE.write_text("", encoding="utf-8")
         return jsonify({"ok": True})
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return _error_response("operation failed", 500, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +988,7 @@ def clear_logs():
 # ---------------------------------------------------------------------------
 
 @app.post("/scrape")
+@limiter.limit("5 per minute")
 def scrape_trigger():
     auth_err = _auth_required()
     if auth_err:
@@ -654,14 +999,84 @@ def scrape_trigger():
     once = bool(data.get("once"))
     if not url:
         return jsonify({"ok": False, "error": "missing url"}), 400
-    SCRAPE_REQUESTS.labels(status="triggered").inc()
-    manual_path = os.path.join(os.environ.get("GHOST_DATA_DIR", "/app/data"), "manual_target.json")
-    try:
-      with open(manual_path, "w", encoding="utf-8") as f:
-        json.dump({"url": url, "interval": interval, "once": True}, f)
-    except Exception as exc:
-      return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify({"ok": True, "url": url, "interval": interval, "once": once}), 202
+
+    if tracer:
+        with tracer.start_as_current_span("ghost.scrape.trigger") as span:
+            span.set_attribute("scrape.url", url)
+            span.set_attribute("scrape.interval", interval)
+            span.set_attribute("scrape.once", once)
+            SCRAPE_REQUESTS.labels(status="queued").inc()
+
+            # Enqueue the scrape job via RQ — returns immediately, worker runs it
+            # Falls back to synchronous execution when Redis/RQ is unavailable.
+            try:
+                if queue is not None:
+                    job = queue.enqueue(
+                        "tasks.scrape_job",
+                        url,
+                        interval,
+                        once,
+                        job_timeout=300,
+                    )
+                    span.set_attribute("rq.job_id", job.id)
+                    span.set_status(trace.StatusCode.OK)
+                    return jsonify({
+                        "ok": True,
+                        "queued": True,
+                        "job_id": job.id,
+                        "url": url,
+                        "interval": interval,
+                        "once": once,
+                    }), 202
+                else:
+                    # Redis not available — run inline for local dev
+                    _run_scrape_inline(url, interval, once)
+                    span.set_status(trace.StatusCode.OK)
+                    return jsonify({
+                        "ok": True,
+                        "queued": False,
+                        "job_id": None,
+                        "url": url,
+                        "interval": interval,
+                        "once": once,
+                        "note": "Redis unavailable; ran synchronously",
+                    }), 200
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(trace.StatusCode.ERROR, str(exc))
+                return _error_response("scrape failed", 500, exc)
+    else:
+        SCRAPE_REQUESTS.labels(status="queued").inc()
+        try:
+            if queue is not None:
+                job = queue.enqueue(
+                    "tasks.scrape_job",
+                    url,
+                    interval,
+                    once,
+                    job_timeout=300,
+                )
+                return jsonify({
+                    "ok": True,
+                    "queued": True,
+                    "job_id": job.id,
+                    "url": url,
+                    "interval": interval,
+                    "once": once,
+                }), 202
+            else:
+                _run_scrape_inline(url, interval, once)
+                return jsonify({
+                    "ok": True,
+                    "queued": False,
+                    "job_id": None,
+                    "url": url,
+                    "interval": interval,
+                    "once": once,
+                    "note": "Redis unavailable; ran synchronously",
+                }), 200
+        except Exception as exc:
+            return _error_response("operation failed", 500, exc)
 
 
 @app.post("/scrape/stop")
@@ -700,7 +1115,7 @@ def db_clear():
             "media_deleted": media_deleted,
         })
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return _error_response("operation failed", 500, exc)
 
 
 # Backup / Restore
@@ -740,7 +1155,7 @@ def restore():
                     target.write_bytes(zf.read(name))
         return jsonify({"ok": True})
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return _error_response("operation failed", 500, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -757,13 +1172,37 @@ def on_disconnect():
     ACTIVE_SOCKETS.dec()
 
 
+@socketio.on("auth")
+def on_auth(data):
+    """Authenticate a SocketIO connection using the GHOST_AUTH_TOKEN."""
+    token = (data or {}).get("token", "")
+    if token == AUTH_TOKEN:
+        emit("auth_ok", {"status": "authenticated"})
+    else:
+        emit("auth_error", {"status": "unauthorized"})
+        # Disconnect unauthenticated clients after a brief allow
+        from flask_socketio import disconnect as _disconnect
+        _disconnect()
+
+
+def _run_scrape_inline(url: str, interval: str, once: bool):
+    """Run a scrape synchronously when RQ/Redis is unavailable (local dev)."""
+    from tasks import scrape_job
+    scrape_job(url, interval, once)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Start automated backup scheduler (daemon thread)
+    _backup_thread = threading.Thread(target=_backup_loop, daemon=True, name="ghost-backup")
+    _backup_thread.start()
+    log.info("Automated backup scheduler started | interval=%ds keep=%d", _BACKUP_INTERVAL_SEC, _BACKUP_KEEP)
+
     port = int(os.getenv("GHOST_PORT", "5000"))
-    # Bind address is configurable so a [lorem]-container deployment can restrict
+    # Bind address is configurable so a multi-container deployment can restrict
     # it to loopback. Defaults to 0.0.0.0 to preserve container behaviour.
     host = os.getenv("GHOST_HOST", "0.0.0.0")  # nosec B104 - container default; override with GHOST_HOST
     socketio.run(

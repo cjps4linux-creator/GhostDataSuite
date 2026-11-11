@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from conftest import scraper
+from security import ALLOWED_URL_SCHEMES
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +373,7 @@ def test_encrypted_store_encrypts_the_payload(tmp_path):
     try:
         capture_id = store.store("https://example.com/x", "top secret payload", status="ok")
         row = store.conn.execute(
-            "SELECT encrypted FROM captures WHERE [lorem] = ?", (capture_id,)
+            "SELECT encrypted FROM captures WHERE id = ?", (capture_id,)
         ).fetchone()
         blob = row[0]
         assert b"top secret payload" not in bytes(blob)
@@ -387,7 +388,7 @@ def test_encrypted_store_hashes_the_url(tmp_path):
         url = "https://example.com/x"
         capture_id = store.store(url, "payload", status="ok")
         row = store.conn.execute(
-            "SELECT url_hash FROM captures WHERE [lorem] = ?", (capture_id,)
+            "SELECT url_hash FROM captures WHERE id = ?", (capture_id,)
         ).fetchone()
         assert row[0] == hashlib.sha256(url.encode("utf-8")).hexdigest()
     finally:
@@ -399,7 +400,7 @@ def test_encrypted_store_records_the_status(tmp_path):
     try:
         capture_id = store.store("https://example.com/x", "payload", status="error")
         row = store.conn.execute(
-            "SELECT status FROM captures WHERE [lorem] = ?", (capture_id,)
+            "SELECT status FROM captures WHERE id = ?", (capture_id,)
         ).fetchone()
         assert row[0] == "error"
     finally:
@@ -432,7 +433,7 @@ def test_encrypted_store_can_decrypt_another_store_with_the_same_key(tmp_path):
     first = scraper.EncryptedStore(str(tmp_path / "one.db"), key_file)
     capture_id = first.store("https://example.com/x", "shared secret", status="ok")
     blob = first.conn.execute(
-        "SELECT encrypted FROM captures WHERE [lorem] = ?", (capture_id,)
+        "SELECT encrypted FROM captures WHERE id = ?", (capture_id,)
     ).fetchone()[0]
     first.close()
 
@@ -493,7 +494,7 @@ def test_importing_the_module_created_the_log_directory(sandbox):
 
 
 def test_allowed_url_schemes_constant():
-    assert scraper.ALLOWED_URL_SCHEMES == ("http", "https")
+    assert ALLOWED_URL_SCHEMES == ("http", "https")
 
 
 def test_media_extension_map_covers_the_expected_categories():

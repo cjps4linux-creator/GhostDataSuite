@@ -1,0 +1,38 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: ghost-monitor
+    environment: production
+
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+
+scrape_configs:
+  # Ghost-Data Suite application metrics
+  - job_name: ghost-shell
+    static_configs:
+      - targets: ["ghost-shell:5000"]
+    metrics_path: /metrics
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # Prometheus self-monitoring
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Nginx (if stub_status enabled) — optional, skipped if not available
+  - job_name: nginx
+    static_configs:
+      - targets: ["ghost-nginx-prod:80"]
+    metrics_path: /metrics
+    scrape_interval: 30s
+    honor_labels: true
+
+  # Redis metrics (if redis exporter sidecar added later)
+  - job_name: redis
+    static_configs:
+      - targets: ["ghost-redis:6379"]
+    scrape_interval: 30s

@@ -4,30 +4,73 @@ services:
       context: .
       dockerfile: Dockerfile.ghost
     container_name: ghost-shell
+    user: "1000:1000"
     volumes:
       - ./data:/app/data
       - ./keys:/app/keys
       - ./logs:/app/logs
       - ./media:/app/media
     environment:
-      GHOST_MODE: standard
       SILENT_MODE: "false"
-      GHOST_AUTH_TOKEN: "change-me"
+      GHOST_AUTH_TOKEN: ${GHOST_AUTH_TOKEN}
+      GHOST_PORT: ${GHOST_PORT:-5000}
+      REDIS_URL: redis://ghost-redis:6379/0
     ports:
       - "5000:5000"
-      - "2222:22"
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     tmpfs:
       - /tmp
     command: ["/scripts/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  redis:
+    image: redis:7-alpine
+    container_name: ghost-redis
+    user: "1000:1000"
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
 
   alchemist:
     build:
       context: .
       dockerfile: Dockerfile.alchemist
     container_name: alchemist-core
+    user: "1000:1000"
     volumes:
       - ./data:/app/data
       - ./keys:/app/keys
@@ -43,16 +86,32 @@ services:
       CONFIG_FILE: /app/config/config.yaml
       LOG_PATH: /app/logs/alchemist.log
     depends_on:
-      - ghost-shell
+      ghost-shell:
+        condition: service_healthy
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     tmpfs:
       - /tmp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3; conn=sqlite3.connect('/app/data/alchemy.db'); conn.execute('SELECT 1'); conn.close()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
 
   ghost-monitor:
     image: prom/prometheus:latest
     container_name: ghost-monitor
+    user: "1000:1000"
     volumes:
       - ./data:/data
     ports:
@@ -68,11 +127,12 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: ghost-grafana
+    user: "1000:1000"
     volumes:
       - ./data:/data
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
     ports:
       - "3000:3000"
     depends_on:

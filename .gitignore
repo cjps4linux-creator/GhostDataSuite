@@ -45,9 +45,24 @@ logs/
 # Scraped media
 media/
 
+# Generated auth config (per-launch, never commit)
+static/auth-config.js
+
 # Deployment-specific env (template lives in .env.example)
 .env.production
 .env.*.production
 
 # Stray shell artifacts
 ]+
+
+# Debug / temporary artifacts
+exe_debug.txt
+exe_output.txt
+fix_newline.py
+
+# PyInstaller build intermediates (dist/ is the release artifact)
+build/
+*.spec.build/
+
+# Runtime-generated auth config (per-launch, never commit)
+static/auth-config.js

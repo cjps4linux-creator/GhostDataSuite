@@ -7,57 +7,64 @@ Supports multi-target scheduling from config.
 from __future__ import annotations
 
 import os
-import sys
-import sqlite3
 import json
-import hashlib
 import time
-import logging
-import urllib.request
+import heapq
 from pathlib import Path
 from urllib.parse import urlparse
-from datetime import datetime, timezone
-from cryptography.fernet import Fernet
+from urllib import robotparser
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+from cryptography.fernet import Fernet  # noqa: F401  (re-exported for test compatibility: scraper.Fernet)
+from security import safe_open
+from db_store import EncryptedStore
 
 DB_PATH = os.getenv("DB_PATH", "data/alchemy.db")
 KEY_FILE = os.getenv("ENCRYPTION_KEY_FILE", "keys/master.key")
+GHOST_SERVER_URL = os.getenv("GHOST_SERVER_URL", "").rstrip("/")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config/config.yaml")
 LOG_PATH = os.getenv("LOG_PATH", "logs/alchemist.log")
 
-# Same SSRF guard as ghost_server: only absolute http(s) URLs may be fetched.
-ALLOWED_URL_SCHEMES = ("http", "https")
-
-
-def _is_allowed_url(url: str) -> bool:
-    if not url or not isinstance(url, str):
-        return False
-    try:
-        parsed = urlparse(url.strip())
-    except ValueError:
-        return False
-    if parsed.scheme.lower() not in ALLOWED_URL_SCHEMES:
-        return False
-    return bool(parsed.netloc)
-
-
-def _safe_open(url: str, timeout: int, headers: dict | None = None):
-    if not _is_allowed_url(url):
-        raise ValueError(f"blocked URL scheme or missing host: {url!r}")
-    req = urllib.request.Request(url, headers=headers or {"User-Agent": "GhostDataSuite/1.0"})
-    return urllib.request.urlopen(req, timeout=timeout)  # nosec B310 - scheme and host are validated by _is_allowed_url() above
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "media"))
 
 Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH),
-        logging.StreamHandler(sys.stdout),
-    ],
+
+from logging_config import setup_json_logging
+
+log = setup_json_logging(
+    "alchemist",
+    log_file=LOG_PATH,
+    level=LOG_LEVEL,
+    json_logs=os.getenv("JSON_LOGS", "true").lower() == "true",
 )
-log = logging.getLogger("alchemist")
+
+# OpenTelemetry tracing for scraper
+_tracer = None
+try:
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
+    otel_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if otel_endpoint:
+        provider = TracerProvider()
+        processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=otel_endpoint))
+        provider.add_span_processor(processor)
+        trace.set_tracer_provider(provider)
+        RequestsInstrumentor().instrument()
+        _tracer = trace.get_tracer(__name__)
+        log.info("OpenTelemetry tracing enabled for scraper", endpoint=otel_endpoint)
+    else:
+        log.info("OpenTelemetry tracing disabled for scraper")
+except Exception as exc:  # pragma: no cover
+    log.warning("OpenTelemetry not available for scraper: %s", str(exc))
+    _tracer = None
+
+tracer = _tracer
 
 
 # ---------------------------------------------------------------------------
@@ -79,72 +86,6 @@ def load_targets() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Encryption layer
-# ---------------------------------------------------------------------------
-
-class EncryptedStore:
-    def __init__(self, db_path: str, key_file: str):
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(key_file).parent.mkdir(parents=True, exist_ok=True)
-
-        if not os.path.exists(key_file):
-            key = Fernet.generate_key()
-            with open(key_file, "wb") as fh:
-                fh.write(key)
-            log.info("Generated new master key at %s", key_file)
-
-        with open(key_file, "rb") as fh:
-            self.fernet = Fernet(fh.read())
-
-        self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
-        self._init_schema()
-
-    def _init_schema(self):
-        with self.conn:
-            self.conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS captures (
-                    [lorem]          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at  TEXT NOT NULL,
-                    url_hash    TEXT NOT NULL,
-                    encrypted   BLOB NOT NULL,
-                    status      TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS meta (
-                    key   TEXT PRIMARY KEY,
-                    value TEXT
-                );
-                """
-            )
-        self._set_meta("last_boot", datetime.now(timezone.utc).isoformat())
-
-    def _set_meta(self, key: str, value: str):
-        with self.conn:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value)
-            )
-
-    def store(self, url: str, plaintext: str, status: str = "ok") -> int:
-        encrypted = self.fernet.encrypt(plaintext.encode("utf-8"))
-        url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()
-        created_at = datetime.now(timezone.utc).isoformat()
-        with self.conn:
-            cur = self.conn.execute(
-                "INSERT INTO captures(created_at, url_hash, encrypted, status) VALUES (?, ?, ?, ?)",
-                (created_at, url_hash, encrypted, status),
-            )
-            return cur.lastrowid
-
-    def capture_count(self) -> int:
-        cur = self.conn.execute("SELECT COUNT(*) FROM captures")
-        return cur.fetchone()[0]
-
-    def close(self):
-        self.conn.close()
-
-
-# ---------------------------------------------------------------------------
 # Browser logic
 # ---------------------------------------------------------------------------
 
@@ -163,6 +104,29 @@ def build_headers():
 
 def safe_text(text: str, limit: int = 2000) -> str:
     return text[:limit] if text else ""
+
+
+def notify_server(capture_id: int, url: str, status: str) -> None:
+    """POST capture metadata to the Ghost server so it can emit a SocketIO
+    ``capture_created`` event for real-time dashboard updates.
+
+    Best-effort: failures are logged but never raised, so a down server
+    never breaks the scraper.
+    """
+    if not GHOST_SERVER_URL:
+        return
+    payload = json.dumps({"id": capture_id, "url": url, "status": status}).encode("utf-8")
+    try:
+        req = Request(
+            GHOST_SERVER_URL + "/notify/capture",
+            data=payload,
+            headers={"Content-Type": "application/json", "X-Ghost-Token": os.getenv("GHOST_AUTH_TOKEN", "")},
+            method="POST",
+        )
+        with urlopen(req, timeout=5) as resp:
+            resp.read()
+    except (URLError, HTTPError, OSError) as exc:
+        log.debug("Server notification failed (non-fatal): %s", exc)
 
 
 MEDIA_EXT_MAP = {
@@ -266,7 +230,7 @@ def _download_media(base_dir: Path, capture_id: int, media_urls: list[str]) -> l
         content_type = ""
         size_bytes = 0
         try:
-            with _safe_open(url, 45) as upstream:
+            with safe_open(url, 45) as upstream:
                 data = upstream.read()
                 size_bytes = len(data)
                 content_type = upstream.headers.get("Content-Type", "") or ""
@@ -283,40 +247,6 @@ def _download_media(base_dir: Path, capture_id: int, media_urls: list[str]) -> l
         })
     return results
 
-
-def _store_media_meta(conn: sqlite3.Connection, capture_id: int, items: list[dict]) -> None:
-    with conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS capture_media (
-                [lorem] INTEGER PRIMARY KEY AUTOINCREMENT,
-                capture_id INTEGER NOT NULL,
-                url TEXT NOT NULL,
-                category TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                local_path TEXT NOT NULL,
-                content_type TEXT NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-        for item in items:
-            conn.execute(
-                "INSERT INTO capture_media(capture_id, url, category, filename, local_path, content_type, size_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    capture_id,
-                    item["url"],
-                    item["category"],
-                    item["filename"],
-                    item["path"],
-                    item.get("content_type", "application/octet-stream"),
-                    int(item.get("size_bytes", 0) or 0),
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
-
-
 def run_hooks(stage: str, context: dict):
     """Plugin hook runner. Place hook modules under hooks/."""
     hooks_dir = Path("hooks")
@@ -332,7 +262,232 @@ def run_hooks(stage: str, context: dict):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Browser grid — multiple concurrent Playwright browser instances
+# ---------------------------------------------------------------------------
+
+class BrowserGrid:
+    """Manages multiple Playwright browser instances for concurrent scraping.
+
+    Each browser runs in its own Playwright instance. Contexts are dispensed
+    to the least-loaded browser to distribute load and provide isolation.
+    Individual browsers recycle after a context count or time TTL to avoid
+    memory leaks.
+
+    Usage::
+
+        grid = BrowserGrid(max_browsers=3, max_contexts_per_browser=10)
+        grid.start()
+        context = grid.new_context(user_agent="...")
+        page = context.new_page()
+        # ... scrape ...
+        context.close()
+        grid.stop()
+    """
+
+    def __init__(
+        self,
+        max_browsers: int = 3,
+        max_contexts_per_browser: int = 10,
+        recycle_after: int = 3600,
+    ):
+        self._max_browsers = max_browsers
+        self._max_contexts_per_browser = max_contexts_per_browser
+        self._recycle_after = recycle_after
+        # Each entry: {"playwright": ..., "browser": ..., "context_count": int, "created_at": float}
+        self._browsers: list[dict | None] = []
+
+    def start(self):
+        for _ in range(self._max_browsers):
+            self._add_browser()
+        log.info("Browser grid started | browsers=%d", len(self._browsers))
+
+    def _add_browser(self):
+        from playwright.sync_api import sync_playwright
+
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
+        self._browsers.append({
+            "playwright": pw,
+            "browser": browser,
+            "context_count": 0,
+            "created_at": time.time(),
+        })
+        log.info("Browser grid added browser %d/%d", len(self._browsers), self._max_browsers)
+
+    def _should_recycle(self, b: dict) -> bool:
+        if b["browser"] is None:
+            return True
+        if b["context_count"] >= self._max_contexts_per_browser:
+            return True
+        if b["created_at"] and time.time() - b["created_at"] > self._recycle_after:
+            return True
+        return False
+
+    def _recycle_browser(self, idx: int):
+        b = self._browsers[idx]
+        if b is None:
+            return
+        try:
+            b["browser"].close()
+        except Exception:
+            pass
+        try:
+            b["playwright"].stop()
+        except Exception:
+            pass
+        from playwright.sync_api import sync_playwright
+
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
+        self._browsers[idx] = {
+            "playwright": pw,
+            "browser": browser,
+            "context_count": 0,
+            "created_at": time.time(),
+        }
+        log.info("Browser grid recycled browser %d", idx)
+
+    def new_context(self, user_agent: str):
+        # Find the least-loaded browser that doesn't need recycling
+        best_idx = None
+        best_count = None
+        for i, b in enumerate(self._browsers):
+            if b is None or b["browser"] is None:
+                continue
+            if self._should_recycle(b):
+                self._recycle_browser(i)
+                b = self._browsers[i]
+            if best_count is None or b["context_count"] < best_count:
+                best_idx = i
+                best_count = b["context_count"]
+
+        if best_idx is None:
+            # All browsers exhausted or None; add one if under max
+            if len(self._browsers) < self._max_browsers:
+                self._add_browser()
+                best_idx = len(self._browsers) - 1
+                b = self._browsers[best_idx]
+            else:
+                # Fall back to browser 0 (will be recycled on next call)
+                best_idx = 0
+                b = self._browsers[0]
+
+        context = b["browser"].new_context(user_agent=user_agent)
+        b["context_count"] += 1
+        return context
+
+    def stop(self):
+        for b in self._browsers:
+            if b is None:
+                continue
+            if b["browser"] is not None:
+                try:
+                    b["browser"].close()
+                except Exception:
+                    pass
+            if b["playwright"] is not None:
+                try:
+                    b["playwright"].stop()
+                except Exception:
+                    pass
+        self._browsers = []
+
+
+# ---------------------------------------------------------------------------
+# Domain rate limiter — don't hammer a single host
+# ---------------------------------------------------------------------------
+
+class DomainRateLimiter:
+    """Enforces a minimum delay between requests to the same domain."""
+
+    def __init__(self, min_delay: float = 2.0):
+        self._min_delay = min_delay
+        self._last_request: dict[str, float] = {}
+
+    def wait_if_needed(self, url: str) -> None:
+        domain = urlparse(url).netloc
+        now = time.time()
+        last = self._last_request.get(domain, 0.0)
+        elapsed = now - last
+        if elapsed < self._min_delay:
+            sleep_for = self._min_delay - elapsed
+            log.debug("Rate limiting %s: sleeping %.1fs", domain, sleep_for)
+            time.sleep(sleep_for)
+        self._last_request[domain] = time.time()
+
+
+# ---------------------------------------------------------------------------
+# robots.txt respect — don't scrape disallowed paths
+# ---------------------------------------------------------------------------
+
+class RobotsChecker:
+    """Caches and consults robots.txt before allowing a scrape."""
+
+    def __init__(self, cache_ttl: int = 3600):
+        self._cache: dict[str, robotparser.RobotFileParser] = {}
+        self._cache_time: dict[str, float] = {}
+        self._cache_ttl = cache_ttl
+
+    def is_allowed(self, url: str) -> bool:
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        now = time.time()
+
+        if domain in self._cache and now - self._cache_time.get(domain, 0.0) < self._cache_ttl:
+            rp = self._cache[domain]
+        else:
+            rp = robotparser.RobotFileParser()
+            try:
+                rp.set_url(f"{parsed.scheme}://{domain}/robots.txt")
+                rp.read()
+                self._cache[domain] = rp
+                self._cache_time[domain] = now
+            except Exception as exc:
+                log.warning("robots.txt fetch failed for %s: %s", domain, exc)
+                return True  # Fail open: if we can't read robots.txt, allow
+
+        return rp.can_fetch("*", url)
+
+
+# ---------------------------------------------------------------------------
+# Simple heap-based scheduler — replaces while True / sleep(2)
+# ---------------------------------------------------------------------------
+
+class SimpleScheduler:
+    """A dependency-free scheduler that runs callables at fixed intervals.
+
+    Uses a heap so the next due job is always O(1) to find.  No external
+    packages required.
+    """
+
+    def __init__(self):
+        self._heap: list[tuple[float, int, float, object, tuple]] = []
+        self._counter = 0
+
+    def every(self, seconds: float, func, *args) -> None:
+        run_at = time.time() + seconds
+        heapq.heappush(self._heap, (run_at, self._counter, seconds, func, args))
+        self._counter += 1
+
+    def run_pending(self) -> None:
+        now = time.time()
+        while self._heap and self._heap[0][0] <= now:
+            _run_at, _counter, interval, func, args = heapq.heappop(self._heap)
+            try:
+                func(*args)
+            except Exception as exc:
+                log.exception("Scheduled job failed: %s", exc)
+            heapq.heappush(self._heap, (now + interval, self._counter, interval, func, args))
+            self._counter += 1
+
+    def idle_seconds(self) -> float | None:
+        if not self._heap:
+            return None
+        return max(0.0, self._heap[0][0] - time.time())
+
+
+# ---------------------------------------------------------------------------
+# Main — event-driven scrape loop
 # ---------------------------------------------------------------------------
 
 def main():
@@ -343,95 +498,124 @@ def main():
     media_base = Path(MEDIA_DIR)
     media_base.mkdir(parents=True, exist_ok=True)
 
-    def consume_trigger() -> dict | None:
-      trigger_path = Path(os.environ.get("GHOST_DATA_DIR", "data")) / "trigger.json"
-      manual_path = Path(os.environ.get("GHOST_DATA_DIR", "data")) / "manual_target.json"
-      if manual_path.exists():
+    grid = BrowserGrid(
+        max_browsers=int(os.getenv("BROWSER_MAX_BROWSERS", "3")),
+        max_contexts_per_browser=int(os.getenv("BROWSER_MAX_CONTEXTS", "10")),
+        recycle_after=int(os.getenv("BROWSER_RECYCLE_AFTER", "3600")),
+    )
+    grid.start()
+
+    rate_limiter = DomainRateLimiter(
+        min_delay=float(os.getenv("SCRAPE_DOMAIN_MIN_DELAY", "2.0")),
+    )
+    robots = RobotsChecker()
+    scheduler = SimpleScheduler()
+
+    def scrape_target(target):
+        url = target.get("url") or os.getenv("TARGET_URL", "").strip()
+        if not url:
+            return
+
+        # Domain rate limiting
+        rate_limiter.wait_if_needed(url)
+
+        # robots.txt respect
+        if not robots.is_allowed(url):
+            log.warning("robots.txt disallows scraping: %s", url)
+            try:
+                capture_id = store.store(url, json.dumps({"error": "robots.txt disallowed"}), status="error")
+                notify_server(capture_id, url, "error")
+            except Exception:
+                pass
+            return
+
         try:
-          data = json.loads(manual_path.read_text(encoding="utf-8"))
-          if data.get("once"):
-            log.info("One-shot manual scrape: %s", data.get("url"))
-            return data
-          return data
+            context = grid.new_context(user_agent=build_headers()["User-Agent"])
+            page = context.new_page()
+            log.info("Navigating to %s", url)
+            try:
+                page.goto(url, timeout=90_000, wait_until="domcontentloaded")
+            except Exception as exc:
+                log.warning("Navigation failed on first attempt: %s", exc)
+                try:
+                    page.goto(url, timeout=90_000, wait_until="domcontentloaded")
+                except Exception as exc2:
+                    log.warning("Navigation failed on retry: %s", exc2)
+                    context.close()
+                    return
+            try:
+                title = safe_text(page.title(), 300)
+                body = safe_text(page.inner_text("body"), 4000)
+            except Exception as exc:
+                log.warning("Partial extraction fallback: %s", exc)
+                title = safe_text(page.title(), 300)
+                body = safe_text(page.content(), 2000)
+            payload = json.dumps({"url": url, "title": title, "body": body})
+            capture_id = store.store(url, payload, status="ok")
+            notify_server(capture_id, url, "ok")
+            try:
+                media_urls = _extract_media_urls(page.content(), url)
+                media_items = _download_media(media_base, capture_id, media_urls)
+                store.store_media(capture_id, media_items)
+                log.info(
+                    "Media captured | id=%d media=%d",
+                    capture_id,
+                    len(media_items),
+                )
+            except Exception as exc:
+                log.warning("Media capture failed: %s", exc)
+            run_hooks("post_capture", {"url": url, "status": "ok", "capture_id": capture_id})
+            log.info("Captured and encrypted | title=%s", title or "(none)")
+            context.close()
         except Exception as exc:
-          log.warning("Manual target parse failed: %s", exc)
-      if trigger_path.exists():
-        try:
-          data = json.loads(trigger_path.read_text(encoding="utf-8"))
-          return data
-        except Exception as exc:
-          log.warning("Trigger parse failed: %s", exc)
-      return None
+            log.exception("Scrape failed: %s", exc)
+            try:
+                capture_id = store.store(url, json.dumps({"error": str(exc)}), status="error")
+                notify_server(capture_id, url, "error")
+                run_hooks("post_capture", {"url": url, "status": "error", "error": str(exc)})
+            except Exception:
+                pass
+
+    def check_manual_trigger():
+        manual_path = Path(os.environ.get("GHOST_DATA_DIR", "data")) / "manual_target.json"
+        if manual_path.exists():
+            try:
+                data = json.loads(manual_path.read_text(encoding="utf-8"))
+                if data.get("once"):
+                    log.info("One-shot manual scrape: %s", data.get("url"))
+                    scrape_target(data)
+                    manual_path.unlink()
+                else:
+                    scrape_target(data)
+            except Exception as exc:
+                log.warning("Manual trigger parse failed: %s", exc)
+
+    # Schedule all configured targets at their configured intervals
+    for target in load_targets():
+        interval = int(target.get("interval") or os.getenv("SCRAPE_INTERVAL") or 60)
+        scheduler.every(interval, scrape_target, target)
+        log.info("Scheduled target | url=%s interval=%ds", target.get("url"), interval)
+
+    # Also schedule the env TARGET_URL if present
+    env_url = os.getenv("TARGET_URL", "").strip()
+    if env_url:
+        interval = int(os.getenv("SCRAPE_INTERVAL") or 60)
+        scheduler.every(interval, scrape_target, {"url": env_url, "interval": interval, "enabled": True})
+        log.info("Scheduled env target | url=%s interval=%ds", env_url, interval)
 
     try:
         while True:
-            trigger = consume_trigger()
-            if trigger:
-                url = trigger.get("url")
-                interval = int(trigger.get("interval") or 60)
-                targets = [{"url": url, "interval": interval, "enabled": True}] if url else []
+            check_manual_trigger()
+            scheduler.run_pending()
+            idle = scheduler.idle_seconds()
+            if idle is None:
+                time.sleep(1)
             else:
-                targets = load_targets()
-            for target in targets:
-                url = target.get("url") or os.getenv("TARGET_URL", "").strip()
-                if not url:
-                    continue
-                interval = int(target.get("interval") or os.getenv("SCRAPE_INTERVAL") or 60)
-                try:
-                    from playwright.sync_api import sync_playwright
-
-                    with sync_playwright() as p:
-                        browser = p.chromium.launch(headless=True)
-                        context = browser.new_context(user_agent=build_headers()["User-Agent"])
-                        page = context.new_page()
-                        log.info("Navigating to %s", url)
-                        try:
-                            page.goto(url, timeout=90_000, wait_until="domcontentloaded")
-                        except Exception as exc:
-                            log.warning("Navigation failed on first attempt: %s", exc)
-                            try:
-                                page.goto(url, timeout=90_000, wait_until="domcontentloaded")
-                            except Exception as exc2:
-                                log.warning("Navigation failed on retry: %s", exc2)
-                        try:
-                            title = safe_text(page.title(), 300)
-                            body = safe_text(page.inner_text("body"), 4000)
-                        except Exception as exc:
-                            log.warning("Partial extraction fallback: %s", exc)
-                            title = safe_text(page.title(), 300)
-                            body = safe_text(page.content(), 2000)
-                        payload = json.dumps({"url": url, "title": title, "body": body})
-                        capture_id = store.store(url, payload, status="ok")
-                        try:
-                            media_urls = _extract_media_urls(page.content(), url)
-                            media_items = _download_media(media_base, capture_id, media_urls)
-                            _store_media_meta(store.conn, capture_id, media_items)
-                            log.info(
-                                "Media captured | [lorem]=%d media=%d",
-                                capture_id,
-                                len(media_items),
-                            )
-                        except Exception as exc:
-                            log.warning("Media capture failed: %s", exc)
-                        run_hooks("post_capture", {"url": url, "status": "ok", "capture_id": capture_id})
-                        log.info("Captured and encrypted | title=%s", title or "(none)")
-                        browser.close()
-                except Exception as exc:
-                    log.exception("Scrape failed: %s", exc)
-                    try:
-                        store.store(url, json.dumps({"error": str(exc)}), status="error")
-                        run_hooks("post_capture", {"url": url, "status": "error", "error": str(exc)})
-                    except Exception:
-                        pass
-
-            manual_path = Path(os.environ.get("GHOST_DATA_DIR", "data")) / "manual_target.json"
-            if manual_path.exists():
-                manual_path.unlink()
-            time.sleep(2)
-
+                time.sleep(min(idle, 1.0))
     except KeyboardInterrupt:
         log.info("Shutdown requested")
     finally:
+        grid.stop()
         store.close()
         log.info("Store closed")
 

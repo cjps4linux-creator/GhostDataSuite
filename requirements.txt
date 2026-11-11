@@ -1,9 +1,18 @@
-# Ghost Data Suite  -  runtime dependencies
-flask>=2.3,<3.0
-flask-limiter>=3.5
-flask-socketio>=5.3
-playwright>=1.40,<2.0
-cryptography>=41,<44
-pyyaml>=6.0
-python-dateutil>=2.8
-prometheus-client>=0.20
+# Ghost Data Suite  -  runtime dependencies (pinned exactly)
+flask==3.0.0
+cryptography==42.0.8
+flask-limiter==3.5.0
+redis==5.2.0
+rq==1.11.1
+psycopg2-binary==2.9.9
+SQLAlchemy==2.0.29
+flask-socketio==5.3.6
+playwright==1.49.0
+pyyaml==6.0.2
+python-dateutil==2.9.0.post0
+prometheus-client==0.21.1
+alembic==1.13.1
+opentelemetry-sdk==1.31.0
+opentelemetry-exporter-otlp-proto-http==1.31.0
+opentelemetry-instrumentation-flask==0.48b0
+opentelemetry-instrumentation-requests==0.48b0

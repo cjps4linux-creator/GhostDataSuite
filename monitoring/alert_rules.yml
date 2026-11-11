@@ -1,0 +1,96 @@
+groups:
+  - name: ghost-suite-alerts
+    rules:
+      # ----------------------------------------------------------------------
+      # Service availability
+      # ----------------------------------------------------------------------
+      - alert: GhostShellDown
+        expr: up{job="ghost-shell"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ghost-Data Suite shell is down"
+          description: "The ghost-shell service has been down for more than 1 minute."
+
+      - alert: GhostRedisDown
+        expr: up{job="redis"} == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis is down"
+          description: "Redis rate-limit backend is unreachable."
+
+      # ----------------------------------------------------------------------
+      # Error rate (5xx responses)
+      # ----------------------------------------------------------------------
+      - alert: HighErrorRate
+        expr: >
+          rate(http_requests_total{status=~"5.."}[5m])
+          /
+          rate(http_requests_total[5m])
+          > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High 5xx error rate on Ghost-Data Suite"
+          description: "5xx errors exceed 5% of total requests over the last 5 minutes."
+
+      # ----------------------------------------------------------------------
+      # Scrape performance
+      # ----------------------------------------------------------------------
+      - alert: SlowScrapes
+        expr: >
+          histogram_quantile(0.95, rate(ghost_scrape_duration_seconds_bucket[5m]))
+          > 30
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow scrape response times"
+          description: "95th percentile scrape duration exceeds 30 seconds."
+
+      - alert: ScrapeFailureRateHigh
+        expr: >
+          rate(ghost_scrape_requests_total{status="error"}[5m])
+          /
+          rate(ghost_scrape_requests_total[5m])
+          > 0.20
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High scrape failure rate"
+          description: "More than 20% of scrape requests are failing over the last 5 minutes."
+
+      # ----------------------------------------------------------------------
+      # Disk usage (node exporter would be needed for host disk; this is a
+      # placeholder rule that fires when the app reports disk pressure via
+      # a custom metric, or can be replaced with node_exporter rules)
+      # ----------------------------------------------------------------------
+      - alert: DiskSpaceLow
+        expr: >
+          node_filesystem_avail_bytes{mountpoint="/"}
+          /
+          node_filesystem_size_bytes{mountpoint="/"}
+          < 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk space on host"
+          description: "Available disk space is below 10%."
+
+      # ----------------------------------------------------------------------
+      # Alertmanager health
+      # ----------------------------------------------------------------------
+      - alert: PrometheusNotScraping
+        expr: scrape_duration_seconds{job="ghost-shell"} > 10
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus scrape taking too long"
+          description: "Scraping ghost-shell takes more than 10 seconds."
