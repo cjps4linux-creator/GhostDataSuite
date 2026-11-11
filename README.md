@@ -1,17 +1,21 @@
-# GhostDataSuit
+# GhostDataSuite
 
 <p align="center">
-  <a href="https://github.com/cjps4linux-creator/GhostDataSuit/actions/workflows/ci.yml"><img src="https://github.com/cjps4linux-creator/GhostDataSuit/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/cjps4linux-creator/GhostDataSuit/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/release-v1.0.0-0a7563" alt="Release v1.0.0"></a>
+  <a href="https://github.com/cjps4linux-creator/GhostDataSuite/actions/workflows/ci.yml"><img src="https://github.com/cjps4linux-creator/GhostDataSuite/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/cjps4linux-creator/GhostDataSuite/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/release-v1.0.0-0a7563" alt="Release v1.0.0"></a>
 </p>
 
 A hardened, encrypted web scraping and monitoring stack with dashboard, auth, multi-target support, export, metrics, Playwright-based scraping, RQ task queue, automated backups, and Windows launcher (.exe).
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/cjps4linux-creator/GhostDataSuite/main/assets/main-menu.png" alt="Main Menu Dashboard" width="700">
+</p>
 
 ## Quick Start
 
 ### Option 1: Windows (.exe) — Recommended for desktop use
 
-1. Download `dist/ghost-data-suite.exe` from the [Releases](https://github.com/cjps4linux-creator/GhostDataSuit/releases) page.
+1. Download `dist/ghost-data-suite.exe` from the [Releases](https://github.com/cjps4linux-creator/GhostDataSuite/releases) page.
 2. Double-click `dist/ghost-data-suite.exe` (or run `scripts/launch-ghost-exe.bat`).
 3. The backend auto-starts on `http://127.0.0.1:5000/` and the dashboard opens in your default browser.
 4. `GHOST_AUTH_TOKEN` and `SECRET_KEY` are auto-generated on first launch — no setup required.
@@ -19,7 +23,7 @@ A hardened, encrypted web scraping and monitoring stack with dashboard, auth, mu
 ### Option 2: Docker
 
 ```bash
-cd path/to/GhostDataSuit
+cd path/to/GhostDataSuite
 docker compose up -d --build
 ```
 
