@@ -16,7 +16,7 @@ jobs:
   pipeline-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -46,7 +46,7 @@ jobs:
     needs: "pipeline-test"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build Ghost Shell image
         run: docker build -f Dockerfile.ghost -t ghost-suite:${{ github.sha }} .
       - name: Build Alchemist image
@@ -79,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Deploy to staging
         run: |
           if [ "${{ vars.DEPLOY_STAGING_ENABLED }}" != "true" ]; then
@@ -108,7 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Deploy to production
         run: |
           if [ "${{ vars.DEPLOY_PRODUCTION_ENABLED }}" != "true" ]; then
