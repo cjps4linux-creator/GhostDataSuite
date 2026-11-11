@@ -42,10 +42,19 @@ echo [%APP_NAME%] Generated GHOST_AUTH_TOKEN
 echo [%APP_NAME%] Generated SECRET_KEY
 
 :: 3b. Set Playwright browsers path (required for scraping in .exe)
-set "PLAYWRIGHT_BROWSERS_PATH=%LOCALAPPDATA%\ms-playwright"
-if not exist "%PLAYWRIGHT_BROWSERS_PATH%" (
-    echo [%APP_NAME%] WARNING: Playwright browsers not found at %PLAYWRIGHT_BROWSERS_PATH%
-    echo [%APP_NAME%] Scraping will fail. Run: playwright install chromium
+set "PLAYWRIGHT_BROWSERS_PATH=%LOCALAPPDATA%\\ms-playwright"
+if not exist "%PLAYWRIGHT_BROWSERS_PATH%\\chromium" (
+    echo [%APP_NAME%] Playwright Chromium not found. Installing now (one-time, may take a few minutes)...
+    "%EXE%" --playwright-install >nul 2>&1 || (
+        echo [%APP_NAME%] .exe does not support --playwright-install. Trying pip fallback...
+        python -m playwright install chromium --with-deps >nul 2>&1
+    )
+    if not exist "%PLAYWRIGHT_BROWSERS_PATH%\\chromium" (
+        echo [%APP_NAME%] WARNING: Playwright Chromium installation failed.
+        echo [%APP_NAME%] Scraping will fail. Install manually: playwright install chromium
+    ) else (
+        echo [%APP_NAME%] Playwright Chromium installed successfully.
+    )
 ) else (
     echo [%APP_NAME%] Playwright browsers found at %PLAYWRIGHT_BROWSERS_PATH%
 )

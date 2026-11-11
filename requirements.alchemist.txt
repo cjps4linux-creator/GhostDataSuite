@@ -1,5 +1,5 @@
 playwright>=1.40,<2.0
-cryptography>=50.0.0,<51
+cryptography>=50.0.2,<51
 pyyaml>=6.0
 python-dateutil>=2.8
 aiohttp>=3.9

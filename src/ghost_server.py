@@ -1196,6 +1196,17 @@ def _run_scrape_inline(url: str, interval: str, once: bool):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Handle --playwright-install: one-time browser installation, then exit
+    if "--playwright-install" in sys.argv:
+        import subprocess
+        browsers_path = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "%LOCALAPPDATA%\\ms-playwright")
+        log.info("Installing Playwright Chromium browsers | path=%s", browsers_path)
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
+            env={**os.environ, "PLAYWRIGHT_BROWSERS_PATH": browsers_path},
+        )
+        sys.exit(result.returncode)
+
     # Start automated backup scheduler (daemon thread)
     _backup_thread = threading.Thread(target=_backup_loop, daemon=True, name="ghost-backup")
     _backup_thread.start()
